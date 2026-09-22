@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Explicit local JSONL lifecycle ledger. No global process or session discovery.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+TOOL=session-ledger
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+die() { printf '%s: %s\n' "$TOOL" "$*" >&2; exit 2; }
+. "$ROOT/lib/lock.sh"
+trap lock_release EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+usage() {
+  cat <<'USAGE'
+session-ledger --dir PATH COMMAND [ARGS]
+
+  append EVENT SESSION_ID [--ts YYYY-MM-DDTHH:MM:SSZ] [--by ID] [key=value ...]
+  read                         all rows in append order, JSONL
+  history SESSION_ID           rows in timestamp/sequence order, JSONL
+  latest SESSION_ID            latest chronological row, JSON object
+  live                         merged live-session projections, JSONL
+  validate                     validate records and sequence continuity
+  path                         print ledger filename
+
+Storage is explicit: --dir PATH or SESSION_LEDGER_DIR. All reads and appends use
+one storage-local lock. Lock timeout (SESSION_LEDGER_LOCK_WAIT_S, default 10)
+returns 4 without an operation. SESSION_LEDGER_BY supplies an optional author.
+Identifiers are preserved exactly and compared exactly; no prefix matching.
+Events: launched adopted unreaped needs_input answered stalled near_full conflict
+        lane_done parked finished reaped superseded
+See docs/README.md for lifecycle semantics, interruption and recovery.
+USAGE
+  exit 0
+}
+case "${1:-}" in -h|--help|help|'') usage ;; esac
+STORE="${SESSION_LEDGER_DIR:-}"
+if [ "${1:-}" = --dir ]; then
+  [ $# -ge 2 ] || die '--dir needs PATH'
+  STORE="$2"; shift 2
+fi
+[ -n "$STORE" ] || die 'specify --dir PATH or SESSION_LEDGER_DIR'
+case "$STORE" in /*) ;; *) STORE="$PWD/$STORE" ;; esac
+[ ! -L "$STORE" ] || die 'storage directory must not be a symlink'
+FILE="$STORE/ledger.jsonl"
+[ ! -L "$FILE" ] || die 'ledger must not be a symlink'
+[ ! -e "$FILE" ] || [ -f "$FILE" ] || die 'ledger must be a regular file'
+command -v jq >/dev/null || die 'jq is required'
+SCHEMA="$(cat "$ROOT/lib/schema.jq")"
+valid_id() { jq -en --arg id "$1" "$SCHEMA"'$id | valid_id' >/dev/null || die "invalid identifier '$1'"; }
+read_rows() {
+  if [ -e "$FILE" ]; then
+    jq -Rsc "$SCHEMA"'read_rows' "$FILE"
+  else printf '[]\n'; fi
+}
+enter() {
+  mkdir -p "$STORE"
+  lock_acquire "$STORE/.ledger.lock" "${SESSION_LEDGER_LOCK_WAIT_S:-10}"
+}
+cmd_append() {
+  [ $# -ge 2 ] || die 'append requires EVENT SESSION_ID'
+  local event="$1" sid="$2" ts by="${SESSION_LEDGER_BY:-}" arg k v json seq rows
+  shift 2
+  valid_id "$sid"
+  jq -en --arg e "$event" "$SCHEMA"'events | index($e) != null' >/dev/null || die "unknown event '$event'"
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  json='{}'
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ts) [ $# -ge 2 ] || die '--ts needs a timestamp'; ts="$2"; shift 2; continue ;;
+      --by) [ $# -ge 2 ] || die '--by needs an identifier'; by="$2"; shift 2; continue ;;
+      -*) die "unknown flag '$1'" ;;
+      *=*) arg="$1"; shift ;;
+      *) die "expected key=value, got '$1'" ;;
+    esac
+    k="${arg%%=*}"; v="${arg#*=}"
+    case "$k" in ''|*[!A-Za-z0-9_]*|[0-9]*) die "invalid metadata key '$k'" ;; esac
+    case "$k" in ts|seq|machine|event|session_id|by|last_event|lifecycle_event) die "reserved metadata key '$k'" ;; esac
+    [ -n "$v" ] || continue
+    [ "$k" != superseded_by ] || valid_id "$v"
+    json="$(jq -c --arg k "$k" --arg v "$v" '.[$k] = (if $k == "superseded_by" then $v elif $v == "true" then true elif $v == "false" then false elif ($v|test("\\A(0|[1-9][0-9]*)\\z")) then ($v|tonumber) else $v end)' <<<"$json")"
+  done
+  jq -en --arg ts "$ts" "$SCHEMA"'$ts | valid_ts' >/dev/null || die 'timestamp must be a valid UTC date in YYYY-MM-DDTHH:MM:SSZ form'
+  [ -z "$by" ] || valid_id "$by"
+  json="$(jq -c --arg e "$event" --arg sid "$sid" --arg ts "$ts" --arg by "$by" --arg machine "$(hostname)" '. + {event:$e,session_id:$sid,ts:$ts,machine:$machine} | if $by=="" then . else .by=$by end' <<<"$json")"
+  enter || return $?
+  rows="$(read_rows)" || { printf '%s: existing ledger invalid; append refused\n' "$TOOL" >&2; return 3; }
+  seq="$(jq 'length + 1' <<<"$rows")"
+  json="$(jq -c --argjson seq "$seq" '. + {seq:$seq}' <<<"$json")"
+  jq -e "$SCHEMA"'valid_row' <<<"$json" >/dev/null || return 3
+  # A write failure may leave a partial line. Never print a successful receipt for it.
+  if ! printf '%s\n' "$json" >> "$FILE"; then
+    printf '%s: append failed; inspect ledger before retrying\n' "$TOOL" >&2
+    return 3
+  fi
+  # Keep the lock through exact readback so cooperating readers/writers see whole rows.
+  if ! grep -Fx -- "$json" "$FILE" >/dev/null; then
+    printf '%s: append could not be verified; inspect ledger before retrying\n' "$TOOL" >&2
+    return 3
+  fi
+  lock_release
+  printf '%s\n' "$json"
+}
+cmd_read() {
+  local mode="$1" sid="${2:-}" rows
+  case "$mode" in history|latest) valid_id "$sid" ;; esac
+  enter || return $?
+  rows="$(read_rows)" || { printf '%s: ledger invalid\n' "$TOOL" >&2; return 3; }
+  lock_release
+  case "$mode" in
+    read) jq -c '.[]' <<<"$rows" ;;
+    history) jq -c --arg sid "$sid" "$SCHEMA"'[.[] | select(.session_id == $sid)] | ordered | .[]' <<<"$rows" ;;
+    latest) jq -c --arg sid "$sid" "$SCHEMA"'[.[] | select(.session_id == $sid)] | ordered | last // empty' <<<"$rows" ;;
+    live) jq -c "$SCHEMA"'group_by(.session_id)[] | ordered | select(live_session) | . as $rows | reduce .[] as $r ({}; . + $r) | . + {last_event:($rows|last|.event), lifecycle_event:($rows|last_lifecycle|.event)}' <<<"$rows" ;;
+    validate) jq -r '"valid: \(length) records"' <<<"$rows" ;;
+  esac
+}
+[ $# -ge 1 ] || usage
+cmd="$1"; shift
+case "$cmd" in
+  append) cmd_append "$@" ;;
+  read|list|live|validate) [ $# -eq 0 ] || die "$cmd takes no arguments"; [ "$cmd" != list ] || cmd=read; cmd_read "$cmd" ;;
+  history|latest) [ $# -eq 1 ] || die "$cmd requires one session identifier"; cmd_read "$cmd" "$1" ;;
+  path) [ $# -eq 0 ] || die 'path takes no arguments'; printf '%s\n' "$FILE" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command '$cmd'" ;;
+esac
