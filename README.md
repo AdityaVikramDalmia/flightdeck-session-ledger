@@ -1,8 +1,8 @@
 # session-ledger
 
 > **Deprecated for new Claude Code integrations — 2026-09-22.** Retained as an
-> Apache-2.0 reference project. Public launch remains deferred and the repository
-> remains private. This is a maintainer status decision, not a claim that Claude
+> Apache-2.0 public reference implementation. This is a maintainer status
+> decision, not a claim that Claude
 > Code replaces every capability. No ongoing feature work or support is promised.
 
 An append-only JSONL lifecycle ledger for shell programs. Record launches, observations, and completion; query exact session history or a current live-session projection. It makes no network or model calls and discovers no global sessions.
@@ -25,11 +25,11 @@ Or pass `session-ledger --dir '/path with spaces/state' ...` on each call. `bash
 
 All reads and appends serialize through a storage-local lock. Appends print a JSON receipt only after a checked write and exact readback. Lock contention fails closed. Identifiers remain exact, including full UUIDs; shared prefixes never merge two sessions. A record describes a caller's report, not proof that an OS process exists or has stopped.
 
-See [documentation](docs/README.md) for the event model, storage contract, and recovery. [Provenance](PROVENANCE.md) records the extraction and deliberate changes. Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Repository visibility remains private.
+See [documentation](docs/README.md) for the event model, storage contract, and recovery. [Provenance](PROVENANCE.md) records the extraction and deliberate changes. Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The repository is public.
 
 ## License and maintenance
 
 Copyright 2026 Aditya Dalmia. Licensed under [Apache-2.0](LICENSE), with
-[attribution](NOTICE) and [source provenance](PROVENANCE.md). Public launch is
-deferred; repository access remains private. See the [release preparation index](docs/release/README.md),
+[attribution](NOTICE) and [source provenance](PROVENANCE.md). This is a public
+reference implementation, deprecated for new Claude Code integrations as of 2026-09-22. See the [release preparation index](docs/release/README.md),
 [contributing guide](CONTRIBUTING.md), and [security contact](SECURITY.md).
